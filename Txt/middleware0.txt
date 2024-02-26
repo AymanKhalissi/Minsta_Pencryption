@@ -1,0 +1,136 @@
+data_cipher.py
+
+from cryptography.fernet import Fernet
+
+class DataCipher:
+    def __init__(self, key):
+        self.fernet = Fernet(key)
+
+    def encrypt(self, data):
+        return self.fernet.encrypt(data.encode()).decode()
+
+    def decrypt(self, data):
+        return self.fernet.decrypt(data.encode()).decode()
+    
+
+database_connection.py
+
+import psycopg2
+
+class DatabaseConnection:
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = psycopg2.connect(self.dsn)
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.conn.close()
+
+parse_and_encrypt.py
+
+import re
+from data_cipher import DataCipher
+
+class StatementParserAndEncryptor:
+    def __init__(self, cipher):
+        self.cipher = cipher
+
+    def parse_and_encrypt_insert_statement(self, sql):
+        # This pattern is designed to capture tuples in the VALUES clause, being more lenient with spaces and quotes
+        values_pattern = r"VALUES\s*\((.*?)\),?"
+        # Using re.DOTALL to ensure that newline characters inside the VALUES clause are matched as well
+        tuples = re.findall(values_pattern, sql, re.IGNORECASE | re.DOTALL)
+
+        if not tuples:
+            raise ValueError("SQL statement does not match the expected format or no values found.")
+
+        encrypted_values = []
+
+        for tuple_str in tuples:
+            parts = [part.strip().strip("'\"") for part in tuple_str.split(",")]
+            if len(parts) != 2:
+                print(f"Problematic tuple: {tuple_str}")  # Add this line
+                raise ValueError(f"Unexpected format for values tuple: {tuple_str}")
+
+            username, created_at = parts
+
+            # Encrypt the username
+            encrypted_username = self.cipher.encrypt(username)
+            # Adding encrypted username and plaintext created_at to the list
+            encrypted_values.append((encrypted_username, created_at))
+
+        return encrypted_values
+
+
+user_data_operations.py
+
+def insert_user(conn, cipher, username, created_at):
+    encrypted_username = cipher.encrypt(username)
+    encrypted_created_at = cipher.encrypt(created_at)
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO users (username, created_at) VALUES (%s, %s) RETURNING id;",
+                    (encrypted_username, encrypted_created_at))
+        user_id = cur.fetchone()[0]
+        conn.commit()
+    return user_id
+
+
+def insert_users(conn, cipher, encrypted_username, encrypted_created_at):
+    with conn.cursor() as cur:
+        # Decrypt the created_at value
+        created_at = cipher.decrypt(encrypted_created_at)
+        cur.execute(
+            "INSERT INTO users (username, created_at) VALUES (%s, %s) RETURNING id;",
+            (encrypted_username, created_at)
+        )
+        user_id = cur.fetchone()[0]
+        print(f"User ID {user_id} inserted")
+    conn.commit()
+
+
+
+def get_user(conn, cipher, user_id):
+    with conn.cursor() as cur:
+        cur.execute("SELECT username FROM users WHERE id = %s;", (user_id,))
+        encrypted_username = cur.fetchone()[0]
+        username = cipher.decrypt(encrypted_username)
+    return username
+
+main.py
+
+from data_cipher import DataCipher
+from database_connection import DatabaseConnection
+from user_data_operations import insert_users
+import re
+import time
+
+key = 'q4Zj1rj9w1piWQ41SEE9u7UIFldRxySayKU-_qU4lK0='  
+cipher = DataCipher(key)
+
+dsn = "dbname=Minsta user=postgres password=easypass host=localhost"
+
+# Assuming sql_statement is a string containing tuples of usernames and creation dates
+sql_statement = "INSERT INTO users (username, created_at) VALUES ('Kenton_Kirlin', ...;"
+
+# Extract all the tuples from the SQL statement
+user_data = re.findall(r"\('(.*?)', '(.*?)'\)", sql_statement)
+
+# Encrypt the usernames in the user data
+encrypted_user_data = [
+    (cipher.encrypt(username), cipher.encrypt(created_at))
+    for username, created_at in user_data
+]
+
+# Insert the encrypted data into the database
+with DatabaseConnection(dsn) as conn:
+    start_time = time.time()
+    for i, user_data in enumerate(encrypted_user_data, start=1):
+        encrypted_username, encrypted_created_at = user_data
+        insert_users(conn, cipher, encrypted_username, encrypted_created_at)
+        if i % 10 == 0:  # print progress for every 100 users
+            print(f"Inserted {i} users so far")
+    end_time = time.time()
+    print(f"Inserted all users in {end_time - start_time} seconds")
